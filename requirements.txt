@@ -1,0 +1,6 @@
+google-adk>=2.15,<3
+pydantic>=2
+python-dotenv>=1
+arize-phoenix>=22
+pandas>=2
+scikit-learn>=1.5

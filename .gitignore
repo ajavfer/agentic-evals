@@ -1,0 +1,8 @@
+.venv/
+.env
+traces/
+__pycache__/
+*.pyc
+.pytest_cache/
+examples/demo_scored.*
+examples/*_agentic_report.md

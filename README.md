@@ -1,185 +1,187 @@
-# evalkit
+# Evalkit: Local Tracing & Agentic Evaluation
 
-**A generic, reusable evaluation toolkit for any agentic application** —
-not tied to any one agent, framework demo, or dataset.
+**Evalkit** is a lightweight, vendor-neutral Python toolkit for tracing AI agent
+executions and running bounded, human-in-the-loop agentic evaluations.
 
-Local observability and evaluation toolkit for [Google ADK](https://google.github.io/adk-docs/)
-agents, refactored from the DeepLearning.AI's 'Evaluating and Improving Agentic Applications' labs (M1–M5).
+Built as an open-source technical companion to the
+[HUMXUS Executive Briefings](https://www.humxus.com), Evalkit demonstrates how
+engineering teams can move beyond static prompt testing and establish
+independent quality oversight without locking into a proprietary observability
+platform.
 
-`evalkit` is a library, not an app: point it at *your* agent — any ADK agent,
-any tools, any domain — and feed it *your* traces, trajectories, and eval
-results. Nothing in the package assumes a specific agent exists.
+---
 
-## Layout
+## Why Evalkit?
 
-```
-evalkit/          the toolkit — see below
-examples/         agent_demo.py — reference ADK agent (Northwind Apparel
-                  shop) showing the evalkit integration pattern;
-                  run_eval_demo.py runs it end-to-end (run → code evals +
-                  LLM judge → scored pickle)
-tests/            pytest suite + fixtures (mocked_traces/, mocked_datasets/)
-```
+* **Local, portable telemetry:** Captures nested `chain`, `llm`, and `tool`
+  spans as sanitized JSON files with redaction of sensitive values on export.
+* **True agentic evaluation:** Instead of dumping truncated logs into a single
+  prompt, `AgenticEvaluator` runs a bounded tool-calling loop. It reviews a
+  prioritized overview of episodes and uses read-only tools to inspect full
+  trajectories, search across all loaded runs, and check repository files
+  before diagnosing root causes.
+* **Propose only, human in the loop:** The evaluator never modifies code or
+  applies fixes automatically. It outputs a structured Markdown report with
+  evidence, confidence scores, and a human review checklist.
+* **Non-destructive verification:** Includes a replay hook (`verify_finding`)
+  to test candidate fixes against failing episodes and compare before/after
+  behavior without touching disk.
 
-## Modules
+---
 
-Every module is agent-agnostic: they operate on trajectories, tool calls,
-spans, and score dataframes — never on any specific agent's code or data.
+## Architecture
+
+### Modules
 
 | module | what it gives you |
 |---|---|
-| `evalkit.tracer` | `Span`/`Tracer`: chain/llm/tool spans, sanitize, JSON export, tree render |
+| `evalkit.tracer` | `Span`/`Tracer`: nested `chain`/`llm`/`tool` spans via `tracer.span()`, sanitize, JSON export |
 | `evalkit.instrumentation` | `traced_callbacks(tracer)` + `llm_pacer()` — drop-in ADK callbacks |
-| `evalkit.runner` | `ask_adk()` / `run_batch()` — one query → trajectory row (tools, args, results, latency, `input_tokens`/`output_tokens`) with 429/503 retry; `save_trace` in `finally` so failed attempts still persist |
-| `evalkit.evals` | `load_template()`, `make_judge()` (rubric→`ClassificationEvaluator`, `JUDGE_PROVIDER`/`JUDGE_MODEL` + `OPENAI_*` envs select provider/model), `tool_selection_evaluator()`/`tool_invocation_evaluator()` (spec-driven code evals), `run_evaluators()` |
+| `evalkit.runner` | `ask_adk()` / `run_batch()` — query → trajectory row (tools, args, results, latency, token counts) with 429/503 retry |
+| `evalkit.evals` | `make_judge()` (rubric → `ClassificationEvaluator`), spec-driven `tool_selection`/`tool_invocation` code evals, `run_evaluators()` |
 | `evalkit.scoring` | `score_value/label`, `compare()`, `three_way()`, `cost_table()` |
 | `evalkit.meta` | `judge_vs_human()` — kappa, confusion matrix, disagreements |
 | `evalkit.annotations` | `log_annotations()` — results → Phoenix span annotations |
 | `evalkit.agentic_evaluator` | `AgenticEvaluator` — LLM orchestrator: trace analyst, agent-as-judge, improvement engine, human-augmentation report |
 
-Top-level names are lazy re-exports: `from evalkit import Tracer, make_judge`
-works without importing every submodule.
+### 1. Local Tracer (`evalkit/tracer.py`)
 
-**Contracts:**
+Records execution trees with the `tracer.span(name, kind=...)` context
+manager — nest spans to build `chain` → `llm`/`tool` hierarchies — and exports
+each finished trace as sanitized JSON via `tracer.save_trace()`. Pure Python,
+no framework imports.
 
-- *Trajectory row*: `{input, output, tools_called, trajectory, trajectory_text, n_tool_calls, latency_s, input_tokens, output_tokens}` — produced by `evalkit.runner.ask_adk`, consumed by every evaluator/judge.
-- *Spec lookup*: `fn(question) -> {"expected_tools": set|None, "expected_args": {tool: {arg: substring}}|None}` for the code evaluators.
-- *Rubric*: markdown file with one fenced ` ``` ` block; `{placeholder}` names match dataframe columns.
+### 2. Agentic Evaluator (`evalkit/agentic_evaluator.py`)
 
-### Agentic_Evaluator (`evalkit.agentic_evaluator`)
+Orchestrates four evaluation roles over your traces, trajectories, and
+evaluator scores:
 
-A meta-layer that reviews evalkit's own output. Feed it trace JSONs,
-trajectory pickles, and/or scored result pickles; it normalizes everything
-into "episodes" (query, answer, tool calls, evaluator scores + explanations)
-and asks an LLM to act in four roles — trace analyst, agent-as-judge
-(judges the *trajectory*, surfaces unknown-unknowns), improvement engine
-(proposes fixes, never applies them), and human-augmentation (emits a
-review-ready markdown report with a decision checklist).
+1. **Trace Analyst:** Identifies recurring errors, patterns, and anomalies
+   across runs.
+2. **Agent-as-Judge:** Evaluates the full decision trajectory — not just the
+   final answer — to surface *unknown unknowns*.
+3. **Improvement Engine:** Groups related failures, infers root causes, and
+   proposes concrete fixes (prompt rules, rubric edits, or data fixes).
+4. **Human Augmentation:** Produces a review-ready report and verification
+   checklist, stamped with a UTC `generated` timestamp.
 
-```powershell
-python -m evalkit.agentic_evaluator traces_dir/ scored.pkl --dry-run   # inspect evidence, no API call
-python -m evalkit.agentic_evaluator run_v1_scored.pkl run_v3_scored.pkl --out report.md
-```
+**Prioritized Sampling:** `select_episodes()` automatically prioritizes
+episodes in four tiers: (1) recorded errors, (2) low evaluator scores,
+(3) top-10% latency outliers, and (4) a seeded random sample of normal runs.
 
-The report is stamped with a UTC `generated` timestamp in its header (and in
-the report dict as `generated_at`) so stale reports are distinguishable from
-fresh ones.
+**Read-Only Investigation Tools:** During its loop, the evaluator can call:
 
-The test fixtures under `tests/mocked_*` double as a smoke test for this
-CLI — e.g. `python -m evalkit.agentic_evaluator tests/mocked_traces/v1_scored.pkl --dry-run`.
+* `get_full_episode(episode_id)` — inspects unclipped queries, answers, and
+  tool inputs/outputs.
+* `filter_episodes(...)` — queries across all loaded episodes by error status,
+  tool name, or latency.
+* `search_episodes(keyword)` — case-insensitive search across queries,
+  answers, tools, and errors.
+* `read_repo_file(rel_path)` — enabled only when `repo_root` is set; strictly
+  bounded inside the repository root to prevent path traversal.
 
-## Portability
+---
 
-`evalkit` is layered: the evaluation core is framework-agnostic, and only the
-execution/instrumentation edge is ADK-specific today.
+## Installation
 
-**Works with any agent framework as-is:**
-
-| module | why it's portable |
-|---|---|
-| `evalkit.evals` | builds on `phoenix.evals` + pandas; consumes any results dataframe |
-| `evalkit.scoring` | pandas only — diffs score columns across versions |
-| `evalkit.meta` | pandas + sklearn — judge-vs-human kappa, no agent imports |
-| `evalkit.annotations` | pandas + `phoenix.client` |
-| `evalkit.tracer` | pure Python span recording (`Span`/`Tracer`, sanitize, JSON export, tree render); no framework imports |
-| `evalkit.agentic_evaluator` | inputs (episodes: query, answer, tool calls, scores) are generic; only its internal LLM calls use `google.genai` |
-
-**ADK-specific today:**
-
-- `evalkit.runner` — `ask_adk()`/`run_batch()` import `google.adk` directly.
-- `evalkit.instrumentation` — `traced_callbacks()` is built on ADK's
-  `CallbackContext`/`LlmRequest`/`ToolContext` types.
-
-**Using other frameworks (LangChain, LangGraph, etc.):** the *trajectory row*
-contract is the seam. Any runner that emits
-`{input, output, tools_called, trajectory, trajectory_text, n_tool_calls,
-latency_s, input_tokens, output_tokens}` per query slots into every
-downstream module unchanged — write a thin `ask_*()` for your framework
-(LangChain agents can reuse the same callback-handler pattern; LangGraph has
-native tracing). For observability,
-Phoenix ingests OpenInference/OTEL traces from LangChain/LangGraph natively,
-so `evalkit.annotations` works there too.
-
-`examples/agent_demo.py` shows the ADK reference pattern end-to-end.
-
-## Setup
-
-```powershell
+```bash
+git clone https://github.com/ajavfer/agentic-evals.git
+cd agentic-evals
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+# Windows: .venv\Scripts\activate   |   macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-copy .env_example .env   # then add your GOOGLE_API_KEY
 ```
 
-`.env` options (see `.env_example` for commented details):
+Set your API key in a `.env` file (see .env-example and never commit `.env` to version control):
 
-| variable | default | purpose |
-|---|---|---|
-| `GOOGLE_API_KEY` | — | Gemini API key |
-| `AGENT_MODEL` | `GEMINI_MODEL` fallback | model for the agent under eval |
-| `AGENTIC_MODEL` | `GEMINI_MODEL` fallback | AgenticEvaluator meta-review |
-| `GEMINI_MODEL` | `gemini-3.5-flash-lite` | generic model fallback |
-| `LLM_MIN_INTERVAL_S` | `4.5` | pace model calls (~13 RPM) |
-| `JUDGE_PROVIDER` | `google` | judge backend (`google` or `openai`) |
-| `JUDGE_MODEL` | `gemini-3.5-flash-lite` | LLM-judge model (must match provider) |
-| `OPENAI_API_KEY` | — | key for non-Google judge endpoints |
-| `OPENAI_BASE_URL` | — | OpenAI-compatible endpoint, e.g. `https://api.ifm.ai/v1` |
-| `EVALKIT_LIVE` | unset | set to `1` to enable live (real-LLM) tests |
-| `PHOENIX_COLLECTOR_ENDPOINT` | `http://localhost:6006/v1/traces` | Phoenix OTLP endpoint |
-| `PHOENIX_PROJECT_NAME` | `agent-tracer-adk` | Phoenix project |
+```bash
+GOOGLE_API_KEY=your_api_key_here
+AGENTIC_MODEL=gemini-3.5-flash-lite   # meta-review model
+AGENTIC_MAX_EPISODES=50               # prioritized sample cap per run
+```
 
-## Phoenix UI
+See `.env_example` for all options — including `JUDGE_PROVIDER`/`JUDGE_MODEL`/
+`OPENAI_*` for pointing the LLM judge at a non-Google endpoint.
+
+---
+
+## Quick Start
+
+### 1. Trace an Agent Run
+
+```python
+from evalkit.tracer import Tracer
+
+tracer = Tracer(output_dir="traces")
+
+with tracer.span("customer_support_agent", kind="chain",
+                 input={"query": "sweater price"}):
+    with tracer.span("search_catalog", kind="tool",
+                     input={"query": "sweater"}):
+        result = "Wool sweater - $89"
+
+trace_path = tracer.save_trace()
+```
+
+### 2. Run the Agentic Evaluator (Python)
+
+```python
+from evalkit.agentic_evaluator import AgenticEvaluator
+
+ev = AgenticEvaluator(repo_root=".", max_steps=8)
+ev.add_traces("traces/")          # trace .json files (or a single file)
+# Optionally load trajectory DataFrames (.pkl or .csv) and merge scores:
+# ev.add_trajectories("trajectories.pkl")
+# ev.add_scores("scored_results.pkl")
+
+report = ev.analyze()
+ev.to_markdown("agentic_report.md")
+```
+
+### 3. Run via CLI
+
+```bash
+# Dry run: inspect the prioritized evidence payload without calling the LLM
+python -m evalkit.agentic_evaluator traces/ --dry-run
+
+# Full analysis with repository context and custom output path
+python -m evalkit.agentic_evaluator traces/ --repo-root . --max-steps 8 --out report.md
+```
+
+### 4. Verify a Proposed Fix
+
+```python
+def candidate_runner(payload: dict) -> dict:
+    # Run your updated prompt or agent against payload["query"]
+    return {"answer": "updated response", "errors": None,
+            "tools_called": ["search_catalog"]}
+
+comparison = ev.verify_finding(finding_index=0, candidate_runner=candidate_runner)
+```
+
+---
+
+## Running Tests
+
+The offline suite mocks all LLM calls and verifies tracing, prioritized
+sampling, read-only tools (including path-traversal protection), the
+multi-step tool loop, and `verify_finding`:
+
+```bash
+pytest tests/ -v
+```
+
+Two live tests (`test_live_smoke.py`, `test_judge_quality.py`) hit real LLM
+endpoints and are skipped unless enabled:
 
 ```powershell
-.\.venv\Scripts\phoenix.exe serve      # http://localhost:6006
+$env:EVALKIT_LIVE="1"; python -m pytest tests/ -v
 ```
 
-`evalkit.instrumentation.traced_callbacks(tracer)` records spans into the
-local JSON `Tracer` (files under your chosen trace dir) — Phoenix does not
-consume them directly. To see eval results in Phoenix, run the server and
-push annotations with `evalkit.annotations.log_annotations()` after
-`run_evaluators()`.
+---
 
-## Tests
+## About HUMXUS
 
-```powershell
-pip install pytest   # not in requirements.txt — dev-only dependency
-python -m pytest tests/ -v
-```
-
-Offline suite — no LLM calls, no external data:
-
-| file | what it covers |
-|---|---|
-| `test_agentic_evaluator.py` | unit tests for `evalkit.agentic_evaluator` (episode selection tiers, `get_full_episode`, filtering, repo-file traversal guard, tool-calling loop, `verify_finding`) and a `Tracer.save_trace` regression |
-| `test_evalkit_fixtures.py` | fixture-based tests against `tests/mocked_traces/` and `tests/mocked_datasets/` — real `add_traces`/`add_trajectories`/`add_scores` intake paths plus a full `analyze(dry_run=True)` pipeline |
-| `test_runner.py` | `ask_adk`/`run_batch` behavior: retry/pacing, token fields, trace persistence on error |
-| `test_scoring.py` | `score_value/label`, `compare()`, `three_way()`, `cost_table()` |
-| `test_evals_provider.py` | `make_judge` provider/env wiring (`JUDGE_PROVIDER`, `JUDGE_MODEL`, `OPENAI_*`) |
-
-Live suite — real LLM calls, gated behind `EVALKIT_LIVE=1` (skipped by
-default; `$env:EVALKIT_LIVE="1"; python -m pytest tests/` runs everything):
-
-| file | what it covers |
-|---|---|
-| `test_live_smoke.py` | connectivity ping for agent/judge/meta-reviewer models |
-| `test_judge_quality.py` | judge golden set — 8 known-correct/incorrect synthetic trajectories scored by the real judge; reports agreement %, Cohen's kappa, and per-class precision/recall (currently 8/8, κ=1.0 on `IFM/K2-Horizon`) |
-
-## Notes
-
-- Traces are sanitized on export only — functions still see raw objects.
-- `evalkit.tracer` is framework-agnostic span recording; for non-ADK code
-  instantiate `Tracer`/`Span` directly and emit `llm`/`tool`/`chain` spans
-  around your own calls (Phoenix accepts the same JSON shape).
-- The fixtures under `tests/mocked_*` are derived from the corresponding
-  labs of the DeepLearning.AI course — sample data only, not a dependency
-  on any lab code.
-
-### Gemini free tier
-
-- **Rate limits**: the Gemini free tier allows ~15 requests/min. `llm_pacer()`
-  (in `evalkit.instrumentation`) spaces model calls ~4.5s apart (tune
-  `LLM_MIN_INTERVAL_S`), and runners retry on `429`/`503`. Pacing time shows
-  up in `chain` span duration, not in `llm` spans. Free-tier capacity for
-  individual models varies by demand — `503 UNAVAILABLE` spikes are
-  server-side and transient; retry later or switch `AGENT_MODEL`.
+This repository is maintained by HUMXUS (www.humxus.com), an independent AI advisory practice
+focused on enterprise AI governance, evaluation architectures, and
+vendor-neutral due diligence.

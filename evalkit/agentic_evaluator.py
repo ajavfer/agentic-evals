@@ -52,7 +52,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from evalkit.tracer import walk_spans
+from evalkit.tracer import utc_now, walk_spans
 
 MAX_FIELD = 1500          # chars kept per trajectory/answer field
 MAX_EPISODES = int(os.getenv("AGENTIC_MAX_EPISODES", "50"))
@@ -71,11 +71,7 @@ def _clip(value: Any, limit: int = MAX_FIELD) -> Any:
     return value
 
 
-def _c(value: Any, clip: bool) -> Any:
-    return _clip(value) if clip else value
-
-
-def _trace_to_episode(path: Path, idx: int, *, clip: bool = True) -> dict[str, Any] | None:
+def _trace_to_episode(path: Path, idx: int) -> dict[str, Any] | None:
     """One tracer JSON file -> episode summary."""
     try:
         root = json.loads(path.read_text(encoding="utf-8"))
@@ -92,15 +88,12 @@ def _trace_to_episode(path: Path, idx: int, *, clip: bool = True) -> dict[str, A
     return {
         "id": f"trace-{idx}",
         "source": "trace",
-        "query": _c(inp.get("user_query") or inp.get("query") or "", clip),
-        "answer": _c(out.get("final_answer") or out.get("answer") or "", clip),
+        "query": inp.get("user_query") or inp.get("query") or "",
+        "answer": out.get("final_answer") or out.get("answer") or "",
         "tools": [t.get("name") for t in tools],
-        "trajectory_text": _c(
-            "\n".join(
-                f"{t.get('name')}({_c(t.get('input'), clip)}) -> {_c(t.get('output'), clip)}"
-                for t in tools
-            ),
-            clip,
+        "trajectory_text": "\n".join(
+            f"{t.get('name')}({t.get('input')}) -> {t.get('output')}"
+            for t in tools
         ),
         "n_tool_calls": len(tools),
         "latency_s": round((root.get("duration_ms") or 0) / 1000, 2),
@@ -108,7 +101,7 @@ def _trace_to_episode(path: Path, idx: int, *, clip: bool = True) -> dict[str, A
     }
 
 
-def _df_to_episodes(df: pd.DataFrame, source: str, *, clip: bool = True) -> list[dict[str, Any]]:
+def _df_to_episodes(df: pd.DataFrame, source: str) -> list[dict[str, Any]]:
     rows = []
     for i, row in df.iterrows():
         traj_text = row.get("trajectory_text")
@@ -117,10 +110,10 @@ def _df_to_episodes(df: pd.DataFrame, source: str, *, clip: bool = True) -> list
         ep = {
             "id": f"{source}-{i}",
             "source": source,
-            "query": _c(row.get("input") or row.get("question") or "", clip),
-            "answer": _c(row.get("output") or row.get("response") or "", clip),
+            "query": row.get("input") or row.get("question") or "",
+            "answer": row.get("output") or row.get("response") or "",
             "tools": row.get("tools_called") or [],
-            "trajectory_text": _c(traj_text or "", clip),
+            "trajectory_text": traj_text or "",
             "n_tool_calls": int(row.get("n_tool_calls") or len(row.get("tools_called") or [])),
             "latency_s": row.get("latency_s"),
             "case": row.get("case"),
@@ -135,7 +128,7 @@ def _df_to_episodes(df: pd.DataFrame, source: str, *, clip: bool = True) -> list
                 scores[col[: -len("_score")]] = {
                     "score": cell.get("score"),
                     "label": cell.get("label"),
-                    "explanation": _c(cell.get("explanation", ""), clip) if clip else cell.get("explanation", ""),
+                    "explanation": cell.get("explanation", ""),
                 }
         if scores:
             ep["scores"] = scores
@@ -203,6 +196,18 @@ def _evidence_json(episodes: list[dict]) -> str:
     return json.dumps(episodes, indent=1, default=str)
 
 
+def _run_async(coro):
+    """asyncio.run that also works inside an already-running event loop
+    (e.g. Jupyter) by delegating to a worker thread."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
 # ------------------------------------------------------------- orchestrator
 
 class AgenticEvaluator:
@@ -221,9 +226,9 @@ class AgenticEvaluator:
         )
         self.repo_root = Path(repo_root).resolve() if repo_root else None
         self.max_steps = max_steps
+        # episodes are stored unclipped; select_episodes() clips a copy
+        # for the prompt overview
         self.episodes: list[dict[str, Any]] = []
-        # unclipped copies keyed by episode id, for on-demand inspection
-        self._raw_episodes: dict[str, dict[str, Any]] = {}
         self.report: dict[str, Any] | None = None
         self.tool_calls_made: list[str] = []
         # pace our own genai calls — llm_pacer() only covers ADK agents,
@@ -242,9 +247,6 @@ class AgenticEvaluator:
             ep = _trace_to_episode(f, len(self.episodes))
             if ep:
                 self.episodes.append(ep)
-                raw = _trace_to_episode(f, len(self.episodes) - 1, clip=False)
-                if raw:
-                    self._raw_episodes[ep["id"]] = raw
         return len(self.episodes) - before
 
     def add_trajectories(self, path: str | Path) -> int:
@@ -252,27 +254,29 @@ class AgenticEvaluator:
         p = Path(path)
         df = pd.read_pickle(p) if p.suffix == ".pkl" else pd.read_csv(p)
         before = len(self.episodes)
-        eps = _df_to_episodes(df, p.stem)
-        raws = {e["id"]: e for e in _df_to_episodes(df, p.stem, clip=False)}
-        for ep in eps:
-            self.episodes.append(ep)
-            if ep["id"] in raws:
-                self._raw_episodes[ep["id"]] = raws[ep["id"]]
+        self.episodes.extend(_df_to_episodes(df, p.stem))
         return len(self.episodes) - before
 
     def add_scores(self, path: str | Path, *, key: str = "input") -> int:
-        """Merge evaluator score columns into matching episodes by query text."""
+        """Merge evaluator score columns into episodes matched by query text.
+
+        `key` names the dataframe column holding the query (falls back to
+        input/question when the column is absent)."""
         p = Path(path)
         df = pd.read_pickle(p) if p.suffix == ".pkl" else pd.read_csv(p)
         score_cols = [c for c in df.columns if c.endswith("_score")]
         if not score_cols:
             return 0
-        by_query = {str(r.get("input") or r.get("question")): r for _, r in df.iterrows()}
+        by_query = {
+            str(r.get(key) or r.get("input") or r.get("question")): r
+            for _, r in df.iterrows()
+        }
         n = 0
         for ep in self.episodes:
             if ep.get("scores"):
                 continue  # already scored — first source wins (queries repeat across versions)
-            row = by_query.get(str(ep.get("query")))
+            # same join key on both sides: ep[key] falls back to query text
+            row = by_query.get(str(ep.get(key) or ep.get("query")))
             if row is None:
                 continue
             scores = {}
@@ -282,12 +286,10 @@ class AgenticEvaluator:
                     scores[col[: -len("_score")]] = {
                         "score": cell.get("score"),
                         "label": cell.get("label"),
-                        "explanation": _clip(cell.get("explanation", ""), 400),
+                        "explanation": cell.get("explanation", ""),
                     }
             if scores:
                 ep["scores"] = scores
-                if ep["id"] in self._raw_episodes:
-                    self._raw_episodes[ep["id"]]["scores"] = copy.deepcopy(scores)
                 n += 1
         return n
 
@@ -303,15 +305,28 @@ class AgenticEvaluator:
                 return True
         return False
 
+    @staticmethod
+    def _clip_episode(ep: dict[str, Any]) -> dict[str, Any]:
+        """Prompt-overview copy: long text fields clipped, structure kept."""
+        clipped = dict(ep)
+        for field in ("query", "answer", "trajectory_text"):
+            clipped[field] = _clip(ep.get(field))
+        if ep.get("scores"):
+            clipped["scores"] = {
+                name: {**s, "explanation": _clip(s.get("explanation", ""), 400)}
+                for name, s in ep["scores"].items()
+            }
+        return clipped
+
     def select_episodes(self, max_episodes: int = MAX_EPISODES) -> list[dict[str, Any]]:
-        """Prioritized sample for the initial prompt.
+        """Prioritized sample for the initial prompt — clipped copies.
 
         Order: (1) episodes with errors, (2) low evaluator scores,
         (3) top-10% latency outliers, (4) seeded random sample of the rest.
         """
         eps = list(self.episodes)
         if len(eps) <= max_episodes:
-            return eps
+            return [self._clip_episode(e) for e in eps]
         n = len(eps)
         lat = sorted((e.get("latency_s") or 0 for e in eps), reverse=True)
         cutoff = lat[max(0, int(n * 0.1) - 1)]
@@ -331,12 +346,15 @@ class AgenticEvaluator:
         for tier in tiers[:3]:
             for e in tier:
                 if len(out) >= max_episodes:
-                    return out
+                    break
                 out.append(e)
-        pool = tiers[3]
-        random.Random(42).shuffle(pool)
-        out.extend(pool[: max_episodes - len(out)])
-        return out
+            if len(out) >= max_episodes:
+                break
+        if len(out) < max_episodes:
+            pool = tiers[3]
+            random.Random(42).shuffle(pool)
+            out.extend(pool[: max_episodes - len(out)])
+        return [self._clip_episode(e) for e in out]
 
     # -- investigation tools (read-only) --------------------------------------
 
@@ -351,11 +369,7 @@ class AgenticEvaluator:
         ep = self._episode_by_id(episode_id)
         if ep is None:
             return {"error": f"unknown episode_id: {episode_id}"}
-        full = copy.deepcopy(self._raw_episodes.get(episode_id) or ep)
-        full["id"] = ep.get("id")
-        if ep.get("scores"):
-            full["scores"] = copy.deepcopy(ep["scores"])
-        return full
+        return copy.deepcopy(ep)
 
     def filter_episodes(
         self,
@@ -429,18 +443,16 @@ class AgenticEvaluator:
             "truncated": len(text) > MAX_TOOL_OUTPUT,
         }
 
-    _TOOL_DISPATCH = {
-        "get_full_episode": "get_full_episode",
-        "filter_episodes": "filter_episodes",
-        "search_episodes": "search_episodes",
-        "read_repo_file": "read_repo_file",
-    }
+    _ALLOWED_TOOLS = frozenset({
+        "get_full_episode", "filter_episodes",
+        "search_episodes", "read_repo_file",
+    })
 
     def _run_tool(self, name: str, args: dict[str, Any]) -> Any:
         self.tool_calls_made.append(name)
-        method = getattr(self, self._TOOL_DISPATCH.get(name, ""), None)
-        if method is None:
+        if name not in self._ALLOWED_TOOLS:
             return {"error": f"unknown tool: {name}"}
+        method = getattr(self, name)
         try:
             result = method(**(args or {}))
         except Exception as exc:
@@ -580,7 +592,7 @@ class AgenticEvaluator:
         if not self.episodes:
             raise ValueError("no evidence — call add_traces/add_trajectories first")
         self.tool_calls_made = []
-        raw = asyncio.run(self._agentic_loop(evidence))
+        raw = _run_async(self._agentic_loop(evidence))
         self.report = self._parse(raw)
         self.report["model"] = self.model
         self.report["agent_models"] = sorted(
@@ -588,6 +600,7 @@ class AgenticEvaluator:
         )
         self.report["n_episodes"] = len(self.episodes)
         self.report["tool_calls_made"] = list(self.tool_calls_made)
+        self.report["generated_at"] = utc_now()
         return self.report
 
     @staticmethod
@@ -599,7 +612,11 @@ class AgenticEvaluator:
             data = json.loads(text)
         except json.JSONDecodeError:
             start, end = text.find("{"), text.rfind("}")
-            data = json.loads(text[start : end + 1]) if start >= 0 else {"raw": raw}
+            snippet = text[start : end + 1] if 0 <= start < end else ""
+            try:
+                data = json.loads(snippet) if snippet else {"raw": raw}
+            except json.JSONDecodeError:
+                data = {"raw": raw}
         data.setdefault("findings", [])
         data.setdefault("summary", "")
         data.setdefault("human_checklist", [])
@@ -630,7 +647,7 @@ class AgenticEvaluator:
                        "episode": ep}
             cand = candidate_runner(payload)
             if inspect.isawaitable(cand):
-                cand = asyncio.run(cand)
+                cand = _run_async(cand)
             comparisons.append({
                 "episode_id": ep.get("id"),
                 "query": ep.get("query"),
@@ -659,7 +676,8 @@ class AgenticEvaluator:
         agent_models = r.get("agent_models") or []
         lines = [
             "# Agentic Evaluation Report",
-            f"analyst model: {r.get('model')}"
+            f"generated: {r.get('generated_at', '?')}"
+            f" · analyst model: {r.get('model')}"
             + (f" · agent model(s): {', '.join(agent_models)}" if agent_models else "")
             + f" · episodes: {r.get('n_episodes')}",
         ]
@@ -713,11 +731,8 @@ def main() -> None:
         if p.is_dir() or p.suffix == ".json":
             n = ev.add_traces(p)
         else:
-            df = pd.read_pickle(p) if p.suffix == ".pkl" else pd.read_csv(p)
-            score_cols = [c for c in df.columns if str(c).endswith("_score")]
+            # add_trajectories already attaches any *_score columns it finds
             n = ev.add_trajectories(p)
-            if score_cols:
-                ev.add_scores(p)
         print(f"{p}: +{n} episodes")
 
     result = ev.analyze(dry_run=args.dry_run)

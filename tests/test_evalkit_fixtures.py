@@ -18,7 +18,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from evalkit.agentic_evaluator import AgenticEvaluator, MAX_FIELD
+from evalkit.agentic_evaluator import AgenticEvaluator
 
 ROOT = Path(__file__).resolve().parents[1]
 MOCKED_TRACES = ROOT / "tests" / "mocked_traces"
@@ -45,8 +45,8 @@ def test_add_traces_loads_real_spans():
     assert ep["query"]
     assert ep["tools"], "expected tool spans in trace"
     assert ep["trajectory_text"]
-    # raw copy kept for on-demand inspection
-    assert ep["id"] in ev._raw_episodes
+    # episodes keep full text; get_full_episode serves on-demand detail
+    assert ev.get_full_episode(ep["id"])["trajectory_text"] == ep["trajectory_text"]
 
 
 def test_add_trajectories_attaches_inline_scores():
@@ -57,9 +57,8 @@ def test_add_trajectories_attaches_inline_scores():
     assert ep["scores"], "score columns should attach to episodes"
     labels = {k: v.get("label") for k, v in ep["scores"].items()}
     assert "ungrounded" in labels.values()  # sweater care fails under v1
-    # raw episode is unclipped where the summary was clipped
-    raw = ev._raw_episodes[ep["id"]]
-    assert len(str(raw.get("trajectory_text", ""))) >= len(ep["trajectory_text"])
+    # single unclipped store — the prompt overview clips a copy instead
+    assert ev.get_full_episode(ep["id"])["trajectory_text"] == ep["trajectory_text"]
 
 
 def test_add_scores_merges_onto_traj_only_episodes():

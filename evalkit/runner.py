@@ -73,23 +73,35 @@ async def _ask_once(runner, session_service, question, tracer, *,
                     app_name, user_id) -> dict[str, Any]:
     session = await session_service.create_session(app_name=app_name, user_id=user_id)
     t0 = time.monotonic()
-    with tracer.span("run", kind="chain", input={"user_query": question}) as span:
-        final_text = ""
-        async for event in runner.run_async(
-            user_id=user_id,
-            session_id=session.id,
-            new_message=types.Content(role="user", parts=[types.Part(text=question)]),
-        ):
-            if event.is_final_response() and event.content and event.content.parts:
-                final_text = "".join(
-                    p.text for p in event.content.parts if getattr(p, "text", None)
-                )
-        span.output = {"final_answer": final_text}
-        trajectory = [
-            {"tool": s.name, "args": s.input, "result": s.output}
-            for s in walk_spans(span)
-            if s.kind == "tool"
-        ]
+    span = None
+    try:
+        with tracer.span("run", kind="chain", input={"user_query": question}) as span:
+            final_text = ""
+            async for event in runner.run_async(
+                user_id=user_id,
+                session_id=session.id,
+                new_message=types.Content(role="user", parts=[types.Part(text=question)]),
+            ):
+                if event.is_final_response() and event.content and event.content.parts:
+                    final_text = "".join(
+                        p.text for p in event.content.parts if getattr(p, "text", None)
+                    )
+            span.output = {"final_answer": final_text}
+            trajectory = []
+            tokens = {"input_tokens": 0, "output_tokens": 0}
+            for s in walk_spans(span):
+                if s.kind == "tool":
+                    trajectory.append({"tool": s.name, "args": s.input,
+                                       "result": s.output})
+                elif s.kind == "llm" and isinstance(s.output, dict):
+                    usage = s.output.get("usage") or {}
+                    tokens["input_tokens"] += usage.get("input_tokens") or 0
+                    tokens["output_tokens"] += usage.get("output_tokens") or 0
+    finally:
+        # save every attempt — a crashed run's error trace is often the
+        # one you most want to inspect
+        if span is not None:
+            tracer.save_trace(span)
     return {
         "input": question,
         "output": final_text,
@@ -98,6 +110,8 @@ async def _ask_once(runner, session_service, question, tracer, *,
         "trajectory_text": format_trajectory(trajectory),
         "n_tool_calls": len(trajectory),
         "latency_s": round(time.monotonic() - t0, 2),
+        "input_tokens": tokens["input_tokens"],
+        "output_tokens": tokens["output_tokens"],
     }
 
 
@@ -108,8 +122,9 @@ async def run_batch(
     app_name: str = "app",
     user_id: str = "eval",
     progress: bool = False,
+    repeats: int = 1,
 ) -> list[dict[str, Any]]:
-    """Run every question sequentially through one runner.
+    """Run every question `repeats` times sequentially through one runner.
 
     make_runner() -> (runner, session_service, tracer) — build once per
     batch (e.g. per prompt version) so pacing state is shared.
@@ -117,10 +132,15 @@ async def run_batch(
     can take tens of seconds under LLM pacing."""
     runner, session_service, tracer = make_runner()
     rows = []
-    for i, question in enumerate(questions, 1):
-        if progress:
-            print(f"[{i}/{len(questions)}] {question[:70]}", flush=True)
-        row = await ask_adk(runner, session_service, question, tracer,
-                            app_name=app_name, user_id=user_id)
-        rows.append(row)
+    total = len(questions) * repeats
+    done = 0
+    for rep in range(repeats):
+        for question in questions:
+            done += 1
+            if progress:
+                tag = f" rep {rep + 1}/{repeats}" if repeats > 1 else ""
+                print(f"[{done}/{total}] {question[:70]}{tag}", flush=True)
+            row = await ask_adk(runner, session_service, question, tracer,
+                                app_name=app_name, user_id=user_id)
+            rows.append(row)
     return rows

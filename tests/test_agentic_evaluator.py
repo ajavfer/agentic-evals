@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -82,13 +83,10 @@ def _ev_with_episodes(repo_root=None):
     ev.episodes[0]["tools"] = ["search_catalog"]
     ev.episodes[1]["tools"] = ["check_inventory"]
     ev.episodes[2]["tools"] = ["get_order_status"]
-    ev.episodes[0]["query"] = "where is my sweater order"
-    ev._raw_episodes["e0"] = {
-        "id": "e0", "query": "where is my sweater order " + "x" * 5000,
-        "answer": "full unclipped answer", "tools": ["search_catalog"],
-        "trajectory": [{"name": "search_catalog", "args": {"q": "sweater"}}],
-        "errors": ev.episodes[0]["errors"],
-    }
+    ev.episodes[0]["query"] = "where is my sweater order " + "x" * 5000
+    ev.episodes[0]["trajectory"] = [
+        {"name": "search_catalog", "args": {"q": "sweater"}}
+    ]
     return ev
 
 
@@ -209,6 +207,27 @@ def test_analyze_with_mocked_loop(monkeypatch):
     assert report["findings"][0]["episodes"] == ["e0"]
     assert report["tool_calls_made"] == []
     assert "## Findings" in ev.to_markdown()
+
+
+def test_add_scores_preserves_full_explanation(tmp_path):
+    long_expl = "because " * 200  # > 400 chars
+    p = tmp_path / "scored.pkl"
+    pd.DataFrame({
+        "input": ["q1"],
+        "correctness_score": [
+            {"score": 0.0, "label": "bad", "explanation": long_expl}
+        ],
+    }).to_pickle(p)
+    ev = AgenticEvaluator()
+    ev.episodes.append(_mk_ep(0))
+    ev.episodes[0]["query"] = "q1"
+    assert ev.add_scores(p) == 1
+    # stored unclipped — only the prompt-overview copy is clipped
+    assert (ev.get_full_episode("e0")["scores"]["correctness"]["explanation"]
+            == long_expl)
+    sel = ev.select_episodes()
+    assert sel[0]["scores"]["correctness"]["explanation"].endswith(
+        "...[truncated]")
 
 
 def test_verify_finding_before_after():

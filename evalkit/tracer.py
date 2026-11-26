@@ -5,7 +5,6 @@ One class, pydantic models, context-manager spans only.
 
 from __future__ import annotations
 
-import inspect
 import json
 import re
 import time
@@ -13,7 +12,6 @@ import traceback
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Iterator
 from uuid import uuid4
@@ -196,7 +194,8 @@ class Tracer:
                 span.error["traceback"] = traceback.format_exc()
             raise
         else:
-            span.status = "ok"
+            if span.status == "unset":
+                span.status = "ok"
         finally:
             span.end_time = utc_now()
             span.duration_ms = round((time.perf_counter() - span._started_at) * 1_000, 3)
@@ -205,53 +204,6 @@ class Tracer:
             except ValueError:
                 # ADK runs nodes in copied contexts; the token may not exist here.
                 pass
-
-    def decorator(self, *, kind: str, name: str | None = None):
-        """Wrap a function so each call becomes a span (sync and async)."""
-
-        def decorate(function: Callable[..., Any]) -> Callable[..., Any]:
-            span_name = name or function.__name__
-
-            def call_input(args: tuple, kwargs: dict) -> dict:
-                try:
-                    bound = inspect.signature(function).bind(*args, **kwargs)
-                    return {
-                        k: v for k, v in bound.arguments.items()
-                        if k not in {"self", "cls"}
-                    }
-                except (TypeError, ValueError):
-                    return {"args": args, "kwargs": kwargs}
-
-            if inspect.iscoroutinefunction(function):
-                @wraps(function)
-                async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-                    with self.span(span_name, kind=kind, input=call_input(args, kwargs)) as s:
-                        s.output = await function(*args, **kwargs)
-                        return s.output
-
-                return async_wrapper
-
-            @wraps(function)
-            def wrapper(*args: Any, **kwargs: Any) -> Any:
-                with self.span(span_name, kind=kind, input=call_input(args, kwargs)) as s:
-                    s.output = function(*args, **kwargs)
-                    return s.output
-
-            return wrapper
-
-        return decorate
-
-    def tool(self, function: Callable | None = None, *, name: str | None = None):
-        decorate = self.decorator(kind="tool", name=name)
-        return decorate(function) if function is not None else decorate
-
-    def llm(self, function: Callable | None = None, *, name: str | None = None):
-        decorate = self.decorator(kind="llm", name=name)
-        return decorate(function) if function is not None else decorate
-
-    def chain(self, function: Callable | None = None, *, name: str | None = None):
-        decorate = self.decorator(kind="chain", name=name)
-        return decorate(function) if function is not None else decorate
 
     @property
     def last_trace(self) -> Span | None:

@@ -11,7 +11,8 @@ None (unscored -> 1.0) or::
      "expected_args": {"tool_a": {"arg": "substring"}, ...} | None}
 
 expected_tools: must be a subset of tools_called (extras allowed).
-expected_args:  substring match, case-insensitive, per called tool.
+expected_args:  substring match, case-insensitive; one call to the tool
+                must contain all of its expected substrings.
 """
 
 from __future__ import annotations
@@ -43,11 +44,12 @@ def load_template(rubric_path: str | Path) -> str:
     return blocks[0].strip()
 
 
-def judge_llm(model: str | None = None) -> LLM:
-    """Gemini judge. JUDGE_MODEL env overrides; flash-lite default because
-    gemini-3.5-flash resolves to a 5-RPM free-tier model that 503s."""
+def judge_llm(model: str | None = None, provider: str | None = None) -> LLM:
+    """Gemini judge. JUDGE_MODEL/JUDGE_PROVIDER env override; flash-lite
+    default because gemini-3.5-flash resolves to a 5-RPM free-tier model
+    that 503s."""
     return LLM(
-        provider="google",
+        provider=provider or os.getenv("JUDGE_PROVIDER", "google"),
         model=model or os.getenv("JUDGE_MODEL", "gemini-3.5-flash-lite"),
     )
 
@@ -59,6 +61,7 @@ def make_judge(
     template: str | None = None,
     choices: dict[str, float],
     model: str | None = None,
+    provider: str | None = None,
 ) -> ClassificationEvaluator:
     """Build a ClassificationEvaluator from a rubric file or raw template."""
     if template is None:
@@ -67,7 +70,7 @@ def make_judge(
         template = load_template(rubric_path)
     return ClassificationEvaluator(
         name=name,
-        llm=judge_llm(model),
+        llm=judge_llm(model=model, provider=provider),
         prompt_template=template,
         choices=choices,
     )
@@ -87,7 +90,8 @@ def tool_selection_evaluator(spec_lookup: SpecLookup, name: str = "tool_selectio
 
 
 def tool_invocation_evaluator(spec_lookup: SpecLookup, name: str = "tool_invocation"):
-    """1.0 when every expected arg substring appears in some call's args.
+    """1.0 when some single call to each expected tool contains all of that
+    tool's expected arg substrings (case-insensitive).
     Skips tools that were never called (that's selection's failure)."""
 
     @create_evaluator(name=name, kind="code")
@@ -99,10 +103,12 @@ def tool_invocation_evaluator(spec_lookup: SpecLookup, name: str = "tool_invocat
             calls = [c for c in trajectory if c["tool"] == tool_name]
             if not calls:
                 continue
-            for call in calls:
-                for key, expected in expected_args.items():
-                    if expected.lower() not in str(call["args"].get(key, "")).lower():
-                        return 0.0
+            if not any(
+                all(expected.lower() in str(call["args"].get(key, "")).lower()
+                    for key, expected in expected_args.items())
+                for call in calls
+            ):
+                return 0.0
         return 1.0
 
     return _eval
@@ -126,7 +132,8 @@ def run_evaluators(
         )
     for name in required or []:
         if f"{name}_score" not in results.columns:
-            print(f"Judge '{name}' produced no scores — all calls failed. "
-                  "Check API errors above.")
-            raise SystemExit(1)
+            raise RuntimeError(
+                f"Judge '{name}' produced no scores — all calls failed. "
+                "Check API errors above."
+            )
     return results
